@@ -109,11 +109,12 @@ struct file_operations Surge_driver_fops = {
 //resources and information that should be passed between driver's functions.
 struct cSurgeDeviceInstance
 {
+	spinlock_t m_Lock;
+	unsigned long m_uMMIO_start;
+	unsigned long m_uMMIO_len;
 	u8 __iomem *m_pBAR0_Mem;
 	struct cdev m_Surge_cdev;
 	unsigned int m_uDeviceID;
-	struct cReg32Access m_RegAccessTemp;
-	struct cDmaAccess m_DmaAccessTemp;
 	unsigned m_uIrq;
 	struct semaphore *m_semIrq;
 	void *m_pDmaBuffHost;
@@ -169,11 +170,28 @@ void ReleaseDevice(struct pci_dev *pdev)
 	pci_disable_device(pdev);
 }
 
+static inline void WriteReg32(struct cSurgeDeviceInstance *pDevInstance, unsigned uRegAddress, unsigned uValue)
+{
+	unsigned long flags;
+	spin_lock_irqsave(&pDevInstance->m_Lock, flags);
+	iowrite32(uValue, pDevInstance->m_pBAR0_Mem + uRegAddress);
+	spin_unlock_irqrestore(&pDevInstance->m_Lock, flags);
+}
+
+static inline unsigned ReadReg32(struct cSurgeDeviceInstance *pDevInstance, unsigned uRegAddress)
+{
+	unsigned long flags;
+	unsigned uValue = 0;
+	spin_lock_irqsave(&pDevInstance->m_Lock, flags);
+	uValue = ioread32(pDevInstance->m_pBAR0_Mem + uRegAddress);
+	spin_unlock_irqrestore(&pDevInstance->m_Lock, flags);
+	return uValue;
+}
+
 static int SurgeDriverProbe(struct pci_dev *pdev, const struct pci_device_id *ent)
 {
 	int bar, err, nIrqs, irqVec;
 	u16 vendor, device;
-	unsigned long mmio_start, mmio_len;
 	struct cSurgeDeviceInstance *pDevInstance;
 	unsigned int uiFWVersion;
 	dev_t curr_dev;
@@ -195,6 +213,17 @@ static int SurgeDriverProbe(struct pci_dev *pdev, const struct pci_device_id *en
 		return err;
 	}
 
+	//Allocate memory for the driver device instance data
+	pDevInstance = kzalloc(sizeof(struct cSurgeDeviceInstance), GFP_KERNEL);
+
+	if(!pDevInstance) {
+		printk("kzalloc failed");
+		ReleaseDevice(pdev);
+		return -ENOMEM;
+	}
+
+	spin_lock_init(&pDevInstance->m_Lock);
+
 	//Enable bus mastering
 	pci_set_master(pdev);
 
@@ -208,20 +237,15 @@ static int SurgeDriverProbe(struct pci_dev *pdev, const struct pci_device_id *en
 	}
 
 	//Get start and stop memory offsets for device BAR0
-	mmio_start = pci_resource_start(pdev, 0);
-	mmio_len = pci_resource_len(pdev, 0);
-
-	//Allocate memory for the driver device instance data
-	pDevInstance = kzalloc(sizeof(struct cSurgeDeviceInstance), GFP_KERNEL);
-
-	if(!pDevInstance) {
-		printk("kzalloc failed");
-		ReleaseDevice(pdev);
-		return -ENOMEM;
-	}
+	pDevInstance->m_uMMIO_start = pci_resource_start(pdev, 0);
+	pDevInstance->m_uMMIO_len = pci_resource_len(pdev, 0);
 
 	//Remap BAR0 to a local pointer
-	pDevInstance->m_pBAR0_Mem = ioremap(mmio_start, mmio_len);
+	pDevInstance->m_pBAR0_Mem = pci_iomap(pdev, 0, pDevInstance->m_uMMIO_len);
+	if(sizeof(pDevInstance->m_pBAR0_Mem) == 4)
+		dev_info(&pdev->dev, "pci_iomap > Address=%u, length=%lu", (unsigned)pDevInstance->m_pBAR0_Mem, pDevInstance->m_uMMIO_len);
+	else
+		dev_info(&pdev->dev, "pci_iomap > Address=%llu, length=%lu", (unsigned long long)pDevInstance->m_pBAR0_Mem, pDevInstance->m_uMMIO_len);
 
 	if(!pDevInstance->m_pBAR0_Mem) {
 		printk("ioremap failed");
@@ -238,7 +262,14 @@ static int SurgeDriverProbe(struct pci_dev *pdev, const struct pci_device_id *en
 
 	//Allocate kernel memory buffer for device DMA usage
 	pDevInstance->m_pDmaBuffHost = pci_alloc_consistent(pdev, MAX_DMA_BUFF_SIZE, &pDevInstance->m_pDmaBuffDevice);
-	dev_info(&pdev->dev, "Allocated pci consistent memory buffer: CPU addr=%llu, DMA handle=%llu", (unsigned long long)pDevInstance->m_pDmaBuffHost, (unsigned long long)pDevInstance->m_pDmaBuffDevice);
+	if (sizeof(pDevInstance->m_pDmaBuffHost) == 4)
+		dev_info(&pdev->dev, "Allocated pci consistent memory buffer: CPU addr=%u, DMA handle=%u", (unsigned)pDevInstance->m_pDmaBuffHost, (unsigned)pDevInstance->m_pDmaBuffDevice);
+	else
+		dev_info(&pdev->dev, "Allocated pci consistent memory buffer: CPU addr=%llu, DMA handle=%llu", (unsigned long long)pDevInstance->m_pDmaBuffHost, (unsigned long long)pDevInstance->m_pDmaBuffDevice);
+
+	if(dma_set_coherent_mask(&pdev->dev, DMA_BIT_MASK(32))) {
+		dev_info(&pdev->dev, "Error setting dma coherent mask!");
+	}
 
 	dev_info(&pdev->dev, "Device num = %d", g_uNumDevices);
 	//Maintain a device instance count for each matching device found in the probe
@@ -288,7 +319,7 @@ static int SurgeDriverProbe(struct pci_dev *pdev, const struct pci_device_id *en
 	//Now we can access mapped "m_pBAR0_Mem" from any of the driver's functions
 	pci_set_drvdata(pdev, pDevInstance);
 
-	uiFWVersion = ioread32(pDevInstance->m_pBAR0_Mem + 0);
+	uiFWVersion = ReadReg32(pDevInstance, 0);
 	dev_info(&pdev->dev, "Firmware version = %d.%d\n", (unsigned int)((uiFWVersion >> 8) & 0xFF), (unsigned int)(uiFWVersion & 0xFF));
 
 	return 0;
@@ -313,14 +344,18 @@ irqreturn_t SurgeDriverIrqHandler(int irq, void *dev_id)
 	unsigned u32Mask = 0x10000;
 	unsigned uStatus = 0x0;
 	struct cSurgeDeviceInstance *pDevInstance = (struct cSurgeDeviceInstance *)dev_id;
+	spin_lock(&pDevInstance->m_Lock);
 
 	uStatus = ioread32(pDevInstance->m_pBAR0_Mem + PCIE_IRQ_CTL_STAT_OFFSET);
-	if((uStatus & 0xFFFF0000) == 0)
+	if((uStatus & 0xFFFF0000) == 0) {
+		spin_unlock(&pDevInstance->m_Lock);
 		return IRQ_NONE;
+	}
 
 	//Clear latched interrupt
 	iowrite32(0xffff, pDevInstance->m_pBAR0_Mem + PCIE_IRQ_CTL_STAT_OFFSET);
 	iowrite32(0xffffffff, pDevInstance->m_pBAR0_Mem + PCIE_IRQ_CTL_STAT_OFFSET);
+
 	//Read FW register to flush preceding writes
 	ioread32(pDevInstance->m_pBAR0_Mem);
 
@@ -333,18 +368,25 @@ irqreturn_t SurgeDriverIrqHandler(int irq, void *dev_id)
 		up(pDevInstance->m_semIrq);
 	}
 
+	spin_unlock(&pDevInstance->m_Lock);
 	return IRQ_HANDLED;
 }
 
 static long SurgeDriverIoctl(struct file *file, unsigned int cmd, unsigned long arg)
 {
+	union IoctlTemp
+	{
+		struct cReg32Access m_RegAccessTemp;
+		struct cDmaAccess m_DmaAccessTemp;
+	} Temp;
 	struct cSurgeDeviceInstance *pDevInstance = file->private_data;
 
 	switch(cmd) {
 	case CTL_READ_REG32:
-		if(copy_from_user(&pDevInstance->m_RegAccessTemp, (struct cReg32Access *)arg, sizeof(struct cReg32Access)) == 0) {
-			pDevInstance->m_RegAccessTemp.m_uValue = ioread32(pDevInstance->m_pBAR0_Mem + pDevInstance->m_RegAccessTemp.m_uRegAddress);
-			if(copy_to_user((struct cReg32Access *)arg, &pDevInstance->m_RegAccessTemp, sizeof(struct cReg32Access))) {
+		if(copy_from_user(&Temp.m_RegAccessTemp, (struct cReg32Access *)arg, sizeof(struct cReg32Access)) == 0) {
+			Temp.m_RegAccessTemp.m_uValue = ReadReg32(pDevInstance, Temp.m_RegAccessTemp.m_uRegAddress);
+
+			if(copy_to_user((struct cReg32Access *)arg, &Temp.m_RegAccessTemp, sizeof(struct cReg32Access))) {
 				pr_err("cReg32Access copy_to_user : Err!\n");
 				return -EINVAL;
 			}
@@ -356,8 +398,8 @@ static long SurgeDriverIoctl(struct file *file, unsigned int cmd, unsigned long 
 		break;
 
 	case CTL_WRITE_REG32:
-		if(copy_from_user(&pDevInstance->m_RegAccessTemp, (struct cReg32Access *)arg, sizeof(struct cReg32Access)) == 0) {
-			iowrite32(pDevInstance->m_RegAccessTemp.m_uValue, pDevInstance->m_pBAR0_Mem + pDevInstance->m_RegAccessTemp.m_uRegAddress);
+		if(copy_from_user(&Temp.m_RegAccessTemp, (struct cReg32Access *)arg, sizeof(struct cReg32Access)) == 0) {
+			WriteReg32(pDevInstance, Temp.m_RegAccessTemp.m_uRegAddress, Temp.m_RegAccessTemp.m_uValue);
 		}
 		else {
 			pr_err("cReg32Access copy_from_user : Err!\n");
@@ -366,50 +408,50 @@ static long SurgeDriverIoctl(struct file *file, unsigned int cmd, unsigned long 
 		break;
 
 	case CTL_DMA_TRANSFER:
-		if(copy_from_user(&pDevInstance->m_DmaAccessTemp, (struct cDmaAccess *)arg, sizeof(struct cDmaAccess)) == 0) {
+		if(copy_from_user(&Temp.m_DmaAccessTemp, (struct cDmaAccess *)arg, sizeof(struct cDmaAccess)) == 0) {
 			//Limit the max DMA size
-			if(pDevInstance->m_DmaAccessTemp.m_uSize > MAX_DMA_BUFF_SIZE)
-				pDevInstance->m_DmaAccessTemp.m_uSize = MAX_DMA_BUFF_SIZE;
+			if(Temp.m_DmaAccessTemp.m_uSize > MAX_DMA_BUFF_SIZE)
+				Temp.m_DmaAccessTemp.m_uSize = MAX_DMA_BUFF_SIZE;
 			//Setup buffer pointers
-			if(pDevInstance->m_DmaAccessTemp.m_uDMAReadDir == 0) {
+			if(Temp.m_DmaAccessTemp.m_uDMAReadDir == 0) {
 				//For DMA write, copy user data to DMA buffer
-				if (copy_from_user(pDevInstance->m_pDmaBuffHost, pDevInstance->m_DmaAccessTemp.m_pvUserDataBuffer, pDevInstance->m_DmaAccessTemp.m_uSize) != 0) {
-					pr_err("pDevInstance->m_DmaAccessTemp.m_pvUserDataBuffer copy_from_user : Err!\n");
+				if(copy_from_user(pDevInstance->m_pDmaBuffHost, Temp.m_DmaAccessTemp.m_pvUserDataBuffer, Temp.m_DmaAccessTemp.m_uSize) != 0) {
+					pr_err("Temp.m_DmaAccessTemp.m_pvUserDataBuffer copy_from_user : Err!\n");
 					return -EINVAL;
 				}
 				//Setup write address (read as seen from device's perspective)
-				iowrite32(pDevInstance->m_pDmaBuffDevice, pDevInstance->m_pBAR0_Mem + READ_ADDR_OFFSET);
+				WriteReg32(pDevInstance, READ_ADDR_OFFSET, pDevInstance->m_pDmaBuffDevice);
 				//Start DMA write
-				iowrite32(0x10000, pDevInstance->m_pBAR0_Mem + DCSR_OFFSET);
+				WriteReg32(pDevInstance, DCSR_OFFSET, 0x10000);
 			}
 			else {
 				//For DMA read, setup read address (write as seen from device's perspective)
-				iowrite32(pDevInstance->m_pDmaBuffDevice, pDevInstance->m_pBAR0_Mem + WRITE_ADDR_OFFSET);
+				WriteReg32(pDevInstance, WRITE_ADDR_OFFSET, pDevInstance->m_pDmaBuffDevice);
 				//Start DMA read
-				iowrite32(0x1, pDevInstance->m_pBAR0_Mem + DCSR_OFFSET);
+				WriteReg32(pDevInstance, DCSR_OFFSET, 0x1);
 			}
 
 			//Wait for the DMA to complete
-			if(pDevInstance->m_DmaAccessTemp.m_uTimeout_ms == 0) {
+			if(Temp.m_DmaAccessTemp.m_uTimeout_ms == 0) {
 				if(down_interruptible(pDevInstance->m_semIrq) != 0) {
 					pr_err("down_interruptible was interrupted!\n");
 					return -EINTR;
 				}
 			}
 			else {
-				if(down_timeout(pDevInstance->m_semIrq, pDevInstance->m_DmaAccessTemp.m_uTimeout_ms) != 0) {
+				if(down_timeout(pDevInstance->m_semIrq, Temp.m_DmaAccessTemp.m_uTimeout_ms) != 0) {
 					return -ETIME;
 				}
 			}
 
-			if(pDevInstance->m_DmaAccessTemp.m_uDMAReadDir != 0) {
-				if(copy_to_user(pDevInstance->m_DmaAccessTemp.m_pvUserDataBuffer, pDevInstance->m_pDmaBuffHost, pDevInstance->m_DmaAccessTemp.m_uSize)) {
-					pr_err("pDevInstance->m_DmaAccessTemp.m_pvUserDataBuffer copy_to_user : Err!\n");
+			if(Temp.m_DmaAccessTemp.m_uDMAReadDir != 0) {
+				if(copy_to_user(Temp.m_DmaAccessTemp.m_pvUserDataBuffer, pDevInstance->m_pDmaBuffHost, Temp.m_DmaAccessTemp.m_uSize)) {
+					pr_err("Temp.m_DmaAccessTemp.m_pvUserDataBuffer copy_to_user : Err!\n");
 					return -EINVAL;
 				}
 			}
 
-			if(copy_to_user((struct cDmaAccess *)arg, &pDevInstance->m_DmaAccessTemp, sizeof(struct cDmaAccess)) != 0) {
+			if(copy_to_user((struct cDmaAccess *)arg, &Temp.m_DmaAccessTemp, sizeof(struct cDmaAccess)) != 0) {
 				pr_err("cDmaAccess copy_to_user : Err!\n");
 				return -EINVAL;
 			}
@@ -422,7 +464,7 @@ static long SurgeDriverIoctl(struct file *file, unsigned int cmd, unsigned long 
 
 	case CTL_READ_DRIVER_VERSION:
 		if(copy_to_user((unsigned *)arg, &g_uDriverVersion, sizeof(g_uDriverVersion)) != 0) {
-			pr_err("cDmaAccess copy_to_user : Err!\n");
+			pr_err("Read driver version copy_to_user : Err!\n");
 			return -EINVAL;
 		}
 		break;
